@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/// Minimal UniswapV2-like pair interface (getReserves + token addresses)
+interface IUniswapV2Pair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+/// Liquidity Drain Trap: detect large one-shot withdrawals from an LP pair
+contract LiquidityDrainTrap {
+    // --- Ownership (simple) ---
+    address public owner;
+    modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    // --- Configurable parameters ---
+    // thresholdBps: percent-of-reserves threshold in basis points (10000 = 100%)
+    // absolute thresholds allow guarding against low-liquidity pairs (token units)
+    uint256 public thresholdBps;        // e.g., 2000 = 20%
+    uint256 public absoluteThreshold0;  // token0 absolute amount
+    uint256 public absoluteThreshold1;  // token1 absolute amount
+
+    // Optional guardian contract to call when a trap triggers (address(0) = none)
+    address public guardian;
+
+    // Whitelist (addresses to ignore, e.g., known exchange, migrator)
+    mapping(address => bool) public whitelist;
+
+    // --- Events ---
+    event LiquidityDrainDetected(
+        address indexed pool,
+        address indexed initiator,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 blockNumber
+    );
+
+    event GuardCalled(address indexed guardian, address indexed pool, address indexed initiator);
+
+    // --- Data struct for a collected LP withdrawal / transfer event ---
+    struct LPWithdrawal {
+        address pool;        // pair contract
+        address initiator;   // who triggered the withdrawal (tx origin or from param)
+        uint256 amount0;     // amount of token0 withdrawn / transferred
+        uint256 amount1;     // amount of token1 withdrawn / transferred
+        uint256 reserve0;    // reserve0 at time of collect()
+        uint256 reserve1;    // reserve1 at time of collect()
+        uint256 blockNumber;
+    }
+
+    // --- Configuration setters ---
+    function setThresholdBps(uint256 _bps) external onlyOwner {
+        require(_bps <= 10000, "bps > 10000");
+        thresholdBps = _bps;
+    }
+
+    function setAbsoluteThresholds(uint256 _abs0, uint256 _abs1) external onlyOwner {
+        absoluteThreshold0 = _abs0;
+        absoluteThreshold1 = _abs1;
+    }
+
+    function setGuardian(address _guardian) external onlyOwner {
+        guardian = _guardian;
+    }
+
+    function setWhitelist(address _addr, bool _allowed) external onlyOwner {
+        whitelist[_addr] = _allowed;
+    }
+
+    // --- Collect: gather LP withdrawal data ---
+    // This function is written to be called by an off-chain monitor or indexer that detects
+    // a withdrawal / transfer event and then calls collect() to attach current reserves.
+    // We accept initiator and amounts (amount0/amount1) as inputs because pair transfer events
+    // or burn events are often parsed off-chain. We read reserves on-chain to attach context.
+    function collect(
+        address pool,
+        address initiator,
+        uint256 amount0,
+        uint256 amount1
+    ) public view returns (LPWithdrawal memory) {
+        // fetch reserves from pair (if pair supports interface)
+        (uint112 r0, uint112 r1, ) = IUniswapV2Pair(pool).getReserves();
+        return LPWithdrawal({
+            pool: pool,
+            initiator: initiator,
+            amount0: amount0,
+            amount1: amount1,
+            reserve0: uint256(r0),
+            reserve1: uint256(r1),
+            blockNumber: block.number
+        });
+    }
+
+    // --- Core logic: shouldRespond? ---
+    // Returns true if the withdrawal is suspicious (exceeds relative or absolute thresholds)
+    function shouldRespond(LPWithdrawal calldata data) public view returns (bool) {
+        if (data.pool == address(0)) return false;
+        // ignore whitelisted initiators
+        if (whitelist[data.initiator]) return false;
+
+        // if reserves are zero (weird pair), fall back to absolute thresholds
+        bool over0 = false;
+        bool over1 = false;
+
+        if (data.reserve0 > 0 && thresholdBps > 0) {
+            uint256 bpsAmount0 = (data.reserve0 * thresholdBps) / 10000;
+            if (data.amount0 >= bpsAmount0) over0 = true;
+        } else if (absoluteThreshold0 > 0) {
+            if (data.amount0 >= absoluteThreshold0) over0 = true;
+        }
+
+        if (data.reserve1 > 0 && thresholdBps > 0) {
+            uint256 bpsAmount1 = (data.reserve1 * thresholdBps) / 10000;
+            if (data.amount1 >= bpsAmount1) over1 = true;
+        } else if (absoluteThreshold1 > 0) {
+            if (data.amount1 >= absoluteThreshold1) over1 = true;
+        }
+
+        // trigger if either token withdrawal breaches thresholds
+        return (over0 || over1);
+    }
+
+    // --- Respond: alert and optionally call guardian ---
+    // This should be called by the monitoring/operator once shouldRespond returns true.
+    function respond(LPWithdrawal calldata data) external {
+        require(shouldRespond(data), "No trigger");
+
+        // Emit a detailed alert event
+        emit LiquidityDrainDetected(
+            data.pool,
+            data.initiator,
+            data.amount0,
+            data.amount1,
+            data.reserve0,
+            data.reserve1,
+            data.blockNumber
+        );
+
+        // Optionally call a guardian contract (trusted multisig/time-lock) to take defensive action.
+        // We use a low-level call to avoid interface assumptions. Guardian is expected to be able
+        // to verify the data off-chain or via calldata; here we simply notify with a basic call.
+        if (guardian != address(0)) {
+            // encode minimal info: selector + pool + initiator + amounts
+            // guardian contract should implement a handler for this selector if desired.
+            bytes memory payload = abi.encodeWithSignature(
+                "onLiquidityDrain(address,address,uint256,uint256)",
+                data.pool,
+                data.initiator,
+                data.amount0,
+                data.amount1
+            );
+
+            // protect against reverts: a failed guardian call should not revert the respond()
+            (bool ok, ) = guardian.call(payload);
+            if (ok) {
+                emit GuardCalled(guardian, data.pool, data.initiator);
+            }
+        }
+    }
+
+    // --- Utility: quick helper to compute breach BPS for front-end/off-chain checks ---
+    function breachAmountBps(uint256 reserve, uint256 bps) public pure returns (uint256) {
+        return (reserve * bps) / 10000;
+    }
+
+    // --- Owner: transfer ownership ---
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "zero owner");
+        owner = newOwner;
+    }
+}
